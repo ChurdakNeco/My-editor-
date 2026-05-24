@@ -1,4 +1,4 @@
-# My editor — copy VIM for Rust
+# My editor — copy of VIM for Rust
 
 It's a super fust editor based on ANSI escape sequences
 for learning
