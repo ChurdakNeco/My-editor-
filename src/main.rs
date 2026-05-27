@@ -865,9 +865,6 @@ fn main() -> io::Result<()> {
                                     last_action = Action::Insert;
                                     file.redo.clear();
                                     let pair = match ch {
-                                        '(' => Some(')'),
-                                        '{' => Some('}'),
-                                        '[' => Some(']'),
                                         '"' if file.cursor.x == 0 || !file.lines[file.cursor.y].chars().nth(file.cursor.x - 1).map_or(false, |c| c.is_alphanumeric()) => Some('"'),
                                         '\'' if file.cursor.x == 0 || !file.lines[file.cursor.y].chars().nth(file.cursor.x - 1).map_or(false, |c| c.is_alphanumeric()) => Some('\''),
                                         _ => None,
