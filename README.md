@@ -22,6 +22,7 @@ Requires Rust 1.70+ and a C compiler:
 ```bash
 # Install build tools (Debian/Ubuntu)
 sudo apt-get install -y build-essential
+sudo apt install xclip
 
 # Build
 git clone <repo> && cd editor
