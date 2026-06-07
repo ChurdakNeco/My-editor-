@@ -84,6 +84,7 @@ pub fn default_bindings() -> Vec<(&'static str, KeyCombo)> {
         ("tab_prev", KeyCombo { code: KeyCode::Left, mods: KeyModifiers::CONTROL }),
         ("tab_next", KeyCombo { code: KeyCode::Right, mods: KeyModifiers::CONTROL }),
         ("save_quit", KeyCombo { code: KeyCode::Char('w'), mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT }),
+        ("sysinfo", KeyCombo { code: KeyCode::Char('l'), mods: KeyModifiers::CONTROL }),
     ]
 }
 
@@ -104,7 +105,7 @@ pub fn load_bindings(cfg: &HashMap<String, String>) -> HashMap<String, KeyCombo>
 
 pub fn find_action<'a>(bindings: &'a HashMap<String, KeyCombo>, code: &KeyCode, mods: KeyModifiers) -> Option<&'a str> {
     for (name, combo) in bindings {
-        if combo.code == *code && combo.mods == mods {
+        if combo.code == *code && mods.contains(combo.mods) {
             return Some(name);
         }
     }
@@ -169,9 +170,8 @@ pub fn load_theme(name: &str) -> Option<Theme> {
         if let Some(pos) = line.find(':') {
             let color = line[..pos].trim().to_lowercase();
             let rest = line[pos+1..].trim();
-            let words: Vec<String> = rest.split('"')
-                .filter(|s| !s.trim().is_empty() && *s != " ")
-                .map(|s| s.trim().to_string())
+            let words: Vec<String> = rest.split_whitespace()
+                .map(|s| s.trim_matches('"').to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
             if !words.is_empty() {

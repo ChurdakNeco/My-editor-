@@ -3,7 +3,7 @@ mod editor;
 use crate::config::*;
 use crate::editor::*;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use crossterm::{
@@ -13,6 +13,7 @@ use crossterm::{
 };
 use crossterm::event::{EnableMouseCapture, DisableMouseCapture};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -20,6 +21,7 @@ fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     execute!(io::stdout(), EnableMouseCapture)?;
+    write!(io::stdout(), "\x1b[?2004h")?;
 
     let current_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut tabs: Vec<Tab> = if let Some(path) = &arg_file {
@@ -40,6 +42,10 @@ fn main() -> io::Result<()> {
                     sel_start: Pos { x: 0, y: 0 },
                     search_q: String::new(),
                     search_mode: false,
+                    block_comment: false, block_string: false,
+                    row_off: 0, col_off: 0,
+                    cached_search_q: String::new(), cached_total_matches: 0, cached_current_match: 0,
+                    pasting: false, max_undo: 500,
                 })]
             } else {
                 let entries = scan_dir(&current_dir).unwrap_or_default();
@@ -92,10 +98,12 @@ fn main() -> io::Result<()> {
     let mut tab_width = 4;
     let cfg = load_config_raw();
     if let Some(v) = cfg.get("show_numbers") { show_numbers = v == "true"; }
-    if let Some(v) = cfg.get("tab_width") { if let Ok(n) = v.parse::<usize>() { tab_width = n; } }
+    if let Some(v) = cfg.get("tab_width") { if let Ok(n) = v.parse::<usize>() { if n >= 1 { tab_width = n; } } }
     let theme_name = cfg.get("theme").cloned().unwrap_or_else(|| "default".to_string());
     let mut current_theme: Option<Theme> = load_theme(&theme_name);
     let mut bindings = load_bindings(&cfg);
+    let mut sysinfo_mode: u8 = 1;
+    let mut sysinfo_cache = SysInfoCache::new();
 
     loop {
         print!("\x1B[?25l");
@@ -110,8 +118,10 @@ fn main() -> io::Result<()> {
         let prefix_len = if show_numbers && num_width > 0 { num_width + 1 } else { 0 };
         let text_vw = vw.saturating_sub(prefix_len + 1);
 
-        // scrolling
+        // scrolling — load from tab state
         if let Tab::File(ref file) = tabs[active_tab] {
+            row_off = file.row_off;
+            col_off = file.col_off;
             if file.lines.len() > 0 {
                 if file.cursor.y < row_off { row_off = file.cursor.y; }
                 else if file.cursor.y >= row_off + vh { row_off = file.cursor.y - vh + 1; }
@@ -173,10 +183,26 @@ fn main() -> io::Result<()> {
             if browser.cursor < browser.scroll { let _ = browser.scroll; }
             if browser.cursor >= browser.scroll + vh - 1 { browser.scroll = browser.cursor - vh + 2; }
         }
+        // load block comment state from file
+        let (mut in_block_comment, mut in_block_string) = match &tabs[active_tab] {
+            Tab::File(f) => (f.block_comment, f.block_string),
+            _ => (false, false),
+        };
+
+        // pre-scan from start of file to row_off for correct block state
+        if let Tab::File(ref file) = tabs[active_tab] {
+            if row_off > 0 {
+                let (bc, bs) = prescan_block_state(&file.lines, row_off, false, false);
+                in_block_comment = bc;
+                in_block_string = bs;
+            } else {
+                in_block_comment = false;
+                in_block_string = false;
+            }
+        }
+
         match &tabs[active_tab] {
             Tab::File(file) => {
-                let mut in_block_comment = false;
-                let mut in_block_string = false;
                 let sel_for_line = |li: usize, ll: usize| -> Option<(usize, usize)> {
                     if file.selecting && file.sel_start.y == file.cursor.y && file.sel_start.x == file.cursor.x { return None; }
                     line_sel_range(li, &file.sel_start, &file.cursor, file.selecting, ll)
@@ -286,8 +312,25 @@ fn main() -> io::Result<()> {
             }
         }
 
+        // save block state back to file
+        if let Tab::File(ref mut f) = tabs[active_tab] {
+            f.block_comment = in_block_comment;
+            f.block_string = in_block_string;
+        }
+
+        // update search cache
+        let (search_total, search_idx) = if let Tab::File(ref mut f) = tabs[active_tab] {
+            if f.search_mode && !f.search_q.is_empty() && f.search_q != f.cached_search_q {
+                let all = find_all_matches(&f.lines, &f.search_q);
+                f.cached_total_matches = all.len();
+                f.cached_current_match = all.iter().position(|m| *m == f.cursor).map(|i| i + 1).unwrap_or(0);
+                f.cached_search_q = f.search_q.clone();
+            }
+            (f.cached_total_matches, f.cached_current_match)
+        } else { (0, 0) };
+
         // status bar
-        let status = if cmd_mode {
+        let mut status = if cmd_mode {
             if rename_prompt {
                 let old = rename_target.as_ref().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default();
                 format!("Rename: {} → {}", old, rename_buf)
@@ -296,15 +339,11 @@ fn main() -> io::Result<()> {
             match &tabs[active_tab] {
                 Tab::File(file) => {
                     if file.search_mode {
-                        let all_matches = find_all_matches(&file.lines, &file.search_q);
-                        let total = all_matches.len();
-                        let idx = all_matches.iter().position(|m| *m == file.cursor).map(|i| i + 1).unwrap_or(0);
-                        format!("/ {}  ({}/{})", file.search_q, idx, total)
+                        format!("/ {}  ({}/{})", file.search_q, search_idx, search_total)
                     } else {
-                        let finfo = file.path.as_deref().unwrap_or("[No Name]");
                         let dm = if file.dirty { " [+]" } else { "" };
                         let sm = if file.selecting { " [Sel]" } else { "" };
-                        format!("{}{}{} | Ln {} Col {}", finfo, dm, sm, file.cursor.y + 1, file.cursor.x + 1)
+                        format!("{}{}  Ln {} Col {}", dm, sm, file.cursor.y + 1, file.cursor.x + 1)
                     }
                 }
                 Tab::Browser(_) => {
@@ -312,6 +351,16 @@ fn main() -> io::Result<()> {
                 }
             }
         };
+        if sysinfo_mode > 0 && !cmd_mode {
+            if !matches!(tabs[active_tab], Tab::Browser(_)){
+                refresh_sysinfo(&mut sysinfo_cache);
+                let sys_str = format_sysinfo(&sysinfo_cache.cached, sysinfo_mode);
+                if !sys_str.is_empty() {
+                    status.push_str(" | ");
+                    status.push_str(&sys_str);
+                }
+            }
+        }
         let sp = vw.saturating_sub(status.chars().count());
         print!("\x1B[{};1H\x1B[7m{}{}\x1B[0m\x1B[K", th, " ".repeat(sp), status);
 
@@ -328,6 +377,12 @@ fn main() -> io::Result<()> {
             }
         }
 
+        // save scroll state back to tab
+        if let Tab::File(ref mut file) = tabs[active_tab] {
+            file.row_off = row_off;
+            file.col_off = col_off;
+        }
+
         io::stdout().flush()?;
 
         match event::read()? {
@@ -335,6 +390,17 @@ fn main() -> io::Result<()> {
             let ctrl = KeyModifiers::CONTROL;
             let shift = KeyModifiers::SHIFT;
             let mods = k.modifiers;
+
+            if !(k.modifiers == KeyModifiers::CONTROL && k.code == KeyCode::Char('q'))
+                && !(k.modifiers == KeyModifiers::CONTROL && k.code == KeyCode::Char('Q'))
+                && k.code != KeyCode::Char('\x11')
+            {
+                if let Err(e) = OpenOptions::new().create(true).append(true).open("/tmp/edit_keys.log")
+                    .and_then(|mut f| writeln!(f, "code={:?} mods={:?}", k.code, k.modifiers))
+                {
+                    let _ = e;
+                }
+            }
 
             if cmd_mode {
                 match k.code {
@@ -401,6 +467,7 @@ fn main() -> io::Result<()> {
                             } else {
                                 match cmd_buf.as_str() {
                                     "numlist" => show_numbers = !show_numbers,
+                                "sysinfo" => sysinfo_mode = (sysinfo_mode + 1) % 2,
                                 "q" => break,
                                 "w" => {
                                     if let Tab::File(ref mut file) = tabs[active_tab] {
@@ -468,7 +535,7 @@ fn main() -> io::Result<()> {
                                 "help" => {
                                     let mut text = "\
 === Commands ===\n:q        - quit\n:w        - save file\n:wq       - save and quit\n\
-:numlist  - toggle line numbers\n:set <key> <value>  - set config option\n\
+:numlist  - toggle line numbers\n:sysinfo  - toggle sysinfo display\n:set <key> <value>  - set config option\n\
 :theme <name>       - apply theme\n:mktheme <name>     - create/edit theme\n\
 :edtheme <name>     - open theme for editing\n:<number>           - go to line\n\
 :help               - this help\n\
@@ -490,10 +557,70 @@ fn main() -> io::Result<()> {
                                         path: None, lines, cursor: Pos { x: 0, y: 0 }, dirty: false, snapshot: text,
                                         undo: Vec::new(), redo: Vec::new(), selecting: false, sel_start: Pos { x: 0, y: 0 },
                                         search_q: String::new(), search_mode: false,
+                                        block_comment: false, block_string: false,
+                                        row_off: 0, col_off: 0,
+                                        cached_search_q: String::new(), cached_total_matches: 0, cached_current_match: 0,
+                                        pasting: false, max_undo: 500,
                                     }));
                                     active_tab = tabs.len() - 1;
-                                    row_off = 0;
                                     col_off = 0;
+                                }
+                                cmd if cmd.starts_with("theme ") => {
+                                    let name = cmd[6..].trim();
+                                    if !name.is_empty() {
+                                        current_theme = load_theme(name);
+                                        if current_theme.is_some() { save_theme_setting(name); }
+                                    }
+                                }
+                                cmd if cmd.starts_with("mktheme ") => {
+                                    let name = cmd[8..].trim();
+                                    if !name.is_empty() {
+                                        let th_dir = themes_dir();
+                                        let _ = fs::create_dir_all(&th_dir);
+                                        let path = th_dir.join(format!("{}.theme", name));
+                                        if !path.exists() {
+                                            let tmpl = format!("{}: \"fn\" \"let\" \"mut\" \"pub\" \"struct\" \"enum\" \"impl\" \"use\" \"return\" \"if\" \"else\" \"for\" \"while\" \"match\"\ngreen: \"i32\" \"i64\" \"u32\" \"u64\" \"usize\" \"String\" \"Vec\" \"Result\" \"Option\" \"bool\"\nyellow: \"println\" \"format\"\ncyan: \"std\" \"main\" \"self\" \"super\"\n", name);
+                                            let _ = fs::write(&path, &tmpl);
+                                        }
+                                        if let Ok(content) = fs::read_to_string(&path) {
+                                            let lines: Vec<String> = content.lines().map(String::from).collect();
+                                            let lines = if lines.is_empty() { vec![String::new()] } else { lines };
+                                            tabs.push(Tab::File(FileState {
+                                                path: Some(path.to_string_lossy().to_string()),
+                                                lines, cursor: Pos { x: 0, y: 0 }, dirty: false, snapshot: content,
+                                                undo: Vec::new(), redo: Vec::new(), selecting: false, sel_start: Pos { x: 0, y: 0 },
+                                                search_q: String::new(), search_mode: false,
+                                                block_comment: false, block_string: false,
+                                                row_off: 0, col_off: 0,
+                                                cached_search_q: String::new(), cached_total_matches: 0, cached_current_match: 0,
+                                                pasting: false, max_undo: 500,
+                                            }));
+                                            active_tab = tabs.len() - 1;
+                                        }
+                                    }
+                                }
+                                cmd if cmd.starts_with("edtheme ") => {
+                                    let name = cmd[8..].trim();
+                                    if !name.is_empty() {
+                                        let path = themes_dir().join(format!("{}.theme", name));
+                                        if path.exists() {
+                                            if let Ok(content) = fs::read_to_string(&path) {
+                                                let lines: Vec<String> = content.lines().map(String::from).collect();
+                                                let lines = if lines.is_empty() { vec![String::new()] } else { lines };
+                                                tabs.push(Tab::File(FileState {
+                                                    path: Some(path.to_string_lossy().to_string()),
+                                                    lines, cursor: Pos { x: 0, y: 0 }, dirty: false, snapshot: content,
+                                                    undo: Vec::new(), redo: Vec::new(), selecting: false, sel_start: Pos { x: 0, y: 0 },
+                                                    search_q: String::new(), search_mode: false,
+                                                    block_comment: false, block_string: false,
+                                                    row_off: 0, col_off: 0,
+                                                    cached_search_q: String::new(), cached_total_matches: 0, cached_current_match: 0,
+                                                    pasting: false, max_undo: 500,
+                                                }));
+                                                active_tab = tabs.len() - 1;
+                                            }
+                                        }
+                                    }
                                 }
                                 _ => {}
                             }
@@ -511,10 +638,12 @@ fn main() -> io::Result<()> {
                 continue;
             }
 
-            if let Some(action) = find_action(&bindings, &k.code, mods) {
+            let (norm_code, norm_mods) = normalize_key(&k.code, mods);
+            if let Some(action) = find_action(&bindings, &norm_code, norm_mods) {
                 match action {
                     "reorder" => { reorder_mode = !reorder_mode; continue; }
                     "tab_prev" | "tab_move_left" => {
+                        if let Tab::File(ref mut f) = tabs[active_tab] { f.row_off = row_off; f.col_off = col_off; }
                         if reorder_mode {
                             if active_tab > 0 { tabs.swap(active_tab, active_tab - 1); active_tab -= 1; }
                         } else {
@@ -524,6 +653,7 @@ fn main() -> io::Result<()> {
                         continue;
                     }
                     "tab_next" | "tab_move_right" => {
+                        if let Tab::File(ref mut f) = tabs[active_tab] { f.row_off = row_off; f.col_off = col_off; }
                         if reorder_mode {
                             if active_tab + 1 < tabs.len() { tabs.swap(active_tab, active_tab + 1); active_tab += 1; }
                         } else {
@@ -532,6 +662,7 @@ fn main() -> io::Result<()> {
                         reorder_mode = false;
                         continue;
                     }
+                    "sysinfo" => { sysinfo_mode = (sysinfo_mode + 1) % 2; continue; }
                     _ => {}
                 }
                 reorder_mode = false;
@@ -548,6 +679,7 @@ fn main() -> io::Result<()> {
                                 if let Some(m) = find_next_match(&file.lines, &file.search_q, &file.cursor) {
                                     file.cursor = m;
                                 }
+                                file.cached_search_q.clear();
                             }
                             KeyCode::Backspace => {
                                 file.search_q.pop();
@@ -556,6 +688,7 @@ fn main() -> io::Result<()> {
                                         file.cursor = m;
                                     }
                                 }
+                                file.cached_search_q.clear();
                             }
                             KeyCode::Up => {
                                 let from = Pos { x: file.cursor.x.saturating_sub(1), y: file.cursor.y };
@@ -578,7 +711,8 @@ fn main() -> io::Result<()> {
                         continue;
                     }
 
-                    if let Some(action) = find_action(&bindings, &k.code, mods) {
+                    let (norm_code, norm_mods) = normalize_key(&k.code, mods);
+                    if let Some(action) = find_action(&bindings, &norm_code, norm_mods) {
                         match action {
                             "quit" => break,
                             "save" => {
@@ -606,6 +740,7 @@ fn main() -> io::Result<()> {
                             "redo" => {
                                 if !file.redo.is_empty() {
                                     file.selecting = false;
+                                    if file.undo.len() >= file.max_undo { file.undo.remove(0); }
                                     file.undo.push(file.lines.clone());
                                     file.lines = file.redo.pop().unwrap();
                                     if file.cursor.y >= file.lines.len() { file.cursor.y = file.lines.len().saturating_sub(1); }
@@ -631,7 +766,7 @@ fn main() -> io::Result<()> {
                             }
                             "cut" => {
                                 let same = last_action == Action::Other && last_action != Action::None;
-                                if !same { file.undo.push(file.lines.clone()); }
+                                if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                 last_action = Action::Other;
                                 file.redo.clear();
                                 if file.selecting {
@@ -653,38 +788,11 @@ fn main() -> io::Result<()> {
                             }
                             "paste" => {
                                 let sys_text = sys_clipboard_get().filter(|t| !t.is_empty());
-                                let paste_lines = sys_text
-                                    .as_ref()
-                                    .map(|t| t.lines().map(|l| l.to_string()).collect())
-                                    .or_else(|| if !clipboard.is_empty() { Some(clipboard.clone()) } else { None });
-
-                                if let Some(ref paste_lines) = paste_lines {
-                                    let same = last_action == Action::Other && last_action != Action::None;
-                                    if !same { file.undo.push(file.lines.clone()); }
-                                    last_action = Action::Other;
-                                    file.redo.clear();
-                                    if file.selecting {
-                                        file.cursor = delete_selection(&mut file.lines, &file.sel_start, &file.cursor);
-                                        file.selecting = false;
-                                    }
-                                    if paste_lines.len() == 1 {
-                                        let b = byte_idx(&file.lines[file.cursor.y], file.cursor.x);
-                                        file.lines[file.cursor.y].insert_str(b, &paste_lines[0]);
-                                        file.cursor.x += paste_lines[0].chars().count();
-                                    } else {
-                                        let b = byte_idx(&file.lines[file.cursor.y], file.cursor.x);
-                                        let rest = file.lines[file.cursor.y].split_off(b);
-                                        file.lines[file.cursor.y].push_str(&paste_lines[0]);
-                                        for i in 1..paste_lines.len() {
-                                            file.lines.insert(file.cursor.y + i, paste_lines[i].clone());
-                                        }
-                                        let last_line_idx = file.cursor.y + paste_lines.len() - 1;
-                                        file.lines[last_line_idx].push_str(&rest);
-                                        file.cursor.y = last_line_idx;
-                                        file.cursor.x = paste_lines.last().unwrap().chars().count();
-                                    }
-                                    file.dirty = true;
-                                }
+                                let paste_lines: Vec<String> = sys_text
+                                    .map(|t| t.lines().map(|l| l.replace('\r', "").replace('\t', &" ".repeat(tab_width))).collect())
+                                    .or_else(|| if !clipboard.is_empty() { Some(clipboard.clone()) } else { None })
+                                    .unwrap_or_default();
+                                paste_text(file, &paste_lines, &mut last_action);
                             }
                             "select_all" => {
                                 file.selecting = true;
@@ -695,7 +803,7 @@ fn main() -> io::Result<()> {
                             "delete_line" => {
                                 file.selecting = false;
                                 let same = last_action == Action::Other && last_action != Action::None;
-                                if !same { file.undo.push(file.lines.clone()); }
+                                if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                 last_action = Action::Other;
                                 file.redo.clear();
                                 if file.lines.len() > 1 {
@@ -710,7 +818,7 @@ fn main() -> io::Result<()> {
                             "clear_buffer" => {
                                 file.selecting = false;
                                 let same = last_action == Action::Other && last_action != Action::None;
-                                if !same { file.undo.push(file.lines.clone()); }
+                                if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                 last_action = Action::Other;
                                 file.redo.clear();
                                 file.lines.clear();
@@ -823,7 +931,7 @@ fn main() -> io::Result<()> {
                         KeyCode::Backspace if mods.contains(ctrl) => {
                             file.selecting = false;
                             let same = last_action == Action::Delete && last_action != Action::None;
-                            if !same { file.undo.push(file.lines.clone()); }
+                            if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                             last_action = Action::Delete;
                             file.redo.clear();
                             if file.cursor.x > 0 {
@@ -851,7 +959,7 @@ fn main() -> io::Result<()> {
 
                             if file.selecting {
                                 let same = last_action == Action::Other && last_action != Action::None;
-                                if !same { file.undo.push(file.lines.clone()); }
+                                if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                 last_action = Action::Other;
                                 file.redo.clear();
                                 file.cursor = delete_selection(&mut file.lines, &file.sel_start, &file.cursor);
@@ -860,14 +968,17 @@ fn main() -> io::Result<()> {
 
                             match k.code {
                                 KeyCode::Char(ch) => {
+                                    if (ch as u32) < 0x20 { continue; }
                                     let same = last_action == Action::Insert && last_action != Action::None;
-                                    if !same { file.undo.push(file.lines.clone()); }
+                                    if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                     last_action = Action::Insert;
                                     file.redo.clear();
-                                    let pair = match ch {
-                                        '"' if file.cursor.x == 0 || !file.lines[file.cursor.y].chars().nth(file.cursor.x - 1).map_or(false, |c| c.is_alphanumeric()) => Some('"'),
-                                        '\'' if file.cursor.x == 0 || !file.lines[file.cursor.y].chars().nth(file.cursor.x - 1).map_or(false, |c| c.is_alphanumeric()) => Some('\''),
-                                        _ => None,
+                                    let pair = if file.pasting { None } else {
+                                        match ch {
+                                            '"' if file.cursor.x == 0 || !file.lines[file.cursor.y].chars().nth(file.cursor.x - 1).map_or(false, |c| c.is_alphanumeric()) => Some('"'),
+                                            '\'' if file.cursor.x == 0 || !file.lines[file.cursor.y].chars().nth(file.cursor.x - 1).map_or(false, |c| c.is_alphanumeric()) => Some('\''),
+                                            _ => None,
+                                        }
                                     };
                                     if let Some(close) = pair {
                                         let next = file.lines[file.cursor.y].chars().nth(file.cursor.x);
@@ -894,7 +1005,7 @@ fn main() -> io::Result<()> {
                                 KeyCode::BackTab | KeyCode::Tab if mods.contains(shift) => {
                                     if file.selecting {
                                         let same = last_action == Action::Other && last_action != Action::None;
-                                        if !same { file.undo.push(file.lines.clone()); }
+                                        if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                         last_action = Action::Other;
                                         file.redo.clear();
                                         let top_y = file.sel_start.y.min(file.cursor.y);
@@ -911,7 +1022,7 @@ fn main() -> io::Result<()> {
                                 KeyCode::Tab => {
                                     if file.selecting {
                                         let same = last_action == Action::Other && last_action != Action::None;
-                                        if !same { file.undo.push(file.lines.clone()); }
+                                        if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                         last_action = Action::Other;
                                         file.redo.clear();
                                         let indent = " ".repeat(tab_width);
@@ -924,7 +1035,7 @@ fn main() -> io::Result<()> {
                                         file.dirty = true;
                                     } else {
                                         let same = last_action == Action::Other && last_action != Action::None;
-                                        if !same { file.undo.push(file.lines.clone()); }
+                                        if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                         last_action = Action::Other;
                                         file.redo.clear();
                                         let b = byte_idx(&file.lines[file.cursor.y], file.cursor.x);
@@ -935,7 +1046,7 @@ fn main() -> io::Result<()> {
                                 }
                                 KeyCode::Enter => {
                                     let same = last_action == Action::Other && last_action != Action::None;
-                                    if !same { file.undo.push(file.lines.clone()); }
+                                    if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                     last_action = Action::Other;
                                     file.redo.clear();
                                     let indent: String = file.lines[file.cursor.y].chars().take_while(|&c| c == ' ').collect();
@@ -950,7 +1061,7 @@ fn main() -> io::Result<()> {
                                 KeyCode::Backspace => {
                                     if file.cursor.x > 0 || file.cursor.y > 0 {
                                         let same = last_action == Action::Delete && last_action != Action::None;
-                                        if !same { file.undo.push(file.lines.clone()); }
+                                        if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                         last_action = Action::Delete;
                                         file.redo.clear();
                                     }
@@ -979,7 +1090,7 @@ fn main() -> io::Result<()> {
                                     let cc = file.lines[file.cursor.y].chars().count();
                                     if file.cursor.x < cc || file.cursor.y < file.lines.len() - 1 {
                                         let same = last_action == Action::Delete && last_action != Action::None;
-                                        if !same { file.undo.push(file.lines.clone()); }
+                                        if !same { if file.undo.len() >= file.max_undo { file.undo.remove(0); } file.undo.push(file.lines.clone()); }
                                         last_action = Action::Delete;
                                         file.redo.clear();
                                     }
@@ -1000,7 +1111,8 @@ fn main() -> io::Result<()> {
                 }
 
                 Tab::Browser(browser) => {
-                    if let Some(action) = find_action(&bindings, &k.code, mods) {
+                    let (norm_code, norm_mods) = normalize_key(&k.code, mods);
+                    if let Some(action) = find_action(&bindings, &norm_code, norm_mods) {
                         match action {
                             "quit" => break,
                             "close_tab" => {
@@ -1074,10 +1186,12 @@ fn main() -> io::Result<()> {
                                                 sel_start: Pos { x: 0, y: 0 },
                                                 search_q: String::new(),
                                                 search_mode: false,
+                                                block_comment: false, block_string: false,
+                                                row_off: 0, col_off: 0,
+                                                cached_search_q: String::new(), cached_total_matches: 0, cached_current_match: 0,
+                                                pasting: false, max_undo: 500,
                                             }));
                                             active_tab = tabs.len() - 1;
-                                            row_off = 0;
-                                            col_off = 0;
                                         }
                                     }
                                 }
@@ -1122,17 +1236,30 @@ fn main() -> io::Result<()> {
                         }
 
                         KeyCode::Tab if mods == KeyModifiers::NONE => {
+                            if let Tab::File(ref mut f) = tabs[active_tab] { f.row_off = row_off; f.col_off = col_off; }
                             active_tab = (active_tab + 1) % tabs.len();
                         }
 
                         KeyCode::BackTab | KeyCode::Tab if mods.contains(shift) => {
+                            if let Tab::File(ref mut f) = tabs[active_tab] { f.row_off = row_off; f.col_off = col_off; }
                             active_tab = if active_tab == 0 { tabs.len() - 1 } else { active_tab - 1 };
                         }
-
                         _ => {}
                     }
                 }
             }
+            }
+            Event::Paste(text) => {
+                if !cmd_mode {
+                    if let Tab::File(ref mut file) = tabs[active_tab] {
+                        if !file.search_mode {
+                            let paste_lines: Vec<String> = text.lines()
+                                .map(|l| l.replace('\r', "").replace('\t', &" ".repeat(tab_width)))
+                                .collect();
+                            paste_text(file, &paste_lines, &mut last_action);
+                        }
+                    }
+                }
             }
             Event::Mouse(m) => {
                 if !cmd_mode {
@@ -1179,9 +1306,51 @@ fn main() -> io::Result<()> {
         }
     }
 
+    write!(io::stdout(), "\x1b[?2004l")?;
     execute!(io::stdout(), DisableMouseCapture)?;
     disable_raw_mode()?;
     Ok(())
+}
+
+fn paste_text(file: &mut FileState, paste_lines: &[String], last_action: &mut Action) {
+    if paste_lines.is_empty() { return; }
+    if file.undo.len() >= file.max_undo { file.undo.remove(0); }
+    file.undo.push(file.lines.clone());
+    *last_action = Action::Other;
+    file.redo.clear();
+    if file.selecting {
+        file.cursor = delete_selection(&mut file.lines, &file.sel_start, &file.cursor);
+        file.selecting = false;
+    }
+    file.pasting = true;
+    if paste_lines.len() == 1 {
+        let b = byte_idx(&file.lines[file.cursor.y], file.cursor.x);
+        file.lines[file.cursor.y].insert_str(b, &paste_lines[0]);
+        file.cursor.x += paste_lines[0].chars().count();
+    } else {
+        let b = byte_idx(&file.lines[file.cursor.y], file.cursor.x);
+        let rest = file.lines[file.cursor.y].split_off(b);
+        file.lines[file.cursor.y].push_str(&paste_lines[0]);
+        for i in 1..paste_lines.len() {
+            file.lines.insert(file.cursor.y + i, paste_lines[i].clone());
+        }
+        let last_line_idx = file.cursor.y + paste_lines.len() - 1;
+        file.lines[last_line_idx].push_str(&rest);
+        file.cursor.y = last_line_idx;
+        file.cursor.x = paste_lines.last().unwrap().chars().count();
+    }
+    file.pasting = false;
+    file.dirty = true;
+}
+
+fn normalize_key(code: &KeyCode, mods: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    match code {
+        KeyCode::Char(c) if (1..=26).contains(&(*c as u32)) => {
+            let letter = char::from_u32((*c as u32) + 0x60).unwrap_or(*c);
+            (KeyCode::Char(letter), mods | KeyModifiers::CONTROL)
+        }
+        _ => (*code, mods),
+    }
 }
 
 fn sys_clipboard_set(text: &str) {
@@ -1214,4 +1383,114 @@ fn sys_clipboard_get() -> Option<String> {
         }
     }
     None
+}
+
+struct SysInfo {
+    cpu_pct: f64,
+    rss_kb: u64,
+    layout: String,
+}
+
+struct SysInfoCache {
+    cached: SysInfo,
+    prev_jiffies: u64,
+    prev_time: Instant,
+    has_baseline: bool,
+    last_update: Instant,
+    interval: Duration,
+}
+
+impl SysInfoCache {
+    fn new() -> Self {
+        Self {
+            cached: SysInfo { cpu_pct: 0.0, rss_kb: 0, layout: String::new() },
+            prev_jiffies: 0,
+            prev_time: Instant::now(),
+            has_baseline: false,
+            last_update: Instant::now(),
+            interval: Duration::from_millis(800),
+        }
+    }
+}
+
+fn read_proc_rss_kb() -> Option<u64> {
+    let content = fs::read_to_string("/proc/self/status").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            return rest.trim().split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+fn read_proc_jiffies() -> Option<u64> {
+    let content = fs::read_to_string("/proc/self/stat").ok()?;
+    let rparen = content.rfind(')')?;
+    let rest = &content[rparen + 2..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    if fields.len() < 13 { return None; }
+    let utime: u64 = fields[11].parse().ok()?;
+    let stime: u64 = fields[12].parse().ok()?;
+    Some(utime + stime)
+}
+
+fn detect_layout() -> String {
+    if let Ok(out) = Command::new("setxkbmap").arg("-query").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            for line in s.lines() {
+                let trimmed = line.trim();
+                if let Some(layout) = trimmed.strip_prefix("layout:") {
+                    let layout = layout.trim();
+                    return layout.split(',').next().unwrap_or(layout).trim().to_string();
+                }
+            }
+        }
+    }
+    if let Ok(lang) = std::env::var("LANG") {
+        if lang == "C" || lang == "POSIX" { return "en".to_string(); }
+        if let Some(code) = lang.split('.').next() {
+            if let Some(lang_code) = code.split('_').next() {
+                let lc = lang_code.to_lowercase();
+                if !lc.is_empty() { return lc; }
+            }
+        }
+    }
+    "??".to_string()
+}
+
+fn refresh_sysinfo(cache: &mut SysInfoCache) {
+    let now = Instant::now();
+    if now.duration_since(cache.last_update) < cache.interval {
+        return;
+    }
+    let rss_kb = read_proc_rss_kb().unwrap_or(0);
+    let jiffies = read_proc_jiffies().unwrap_or(0);
+    let layout = detect_layout();
+    let cpu_pct = if cache.has_baseline {
+        let dj = jiffies.saturating_sub(cache.prev_jiffies);
+        let ds = now.duration_since(cache.prev_time).as_secs_f64();
+        if ds > 0.0 { (dj as f64 / ds).min(100.0) } else { cache.cached.cpu_pct }
+    } else {
+        cache.has_baseline = true;
+        0.0
+    };
+    cache.prev_jiffies = jiffies;
+    cache.prev_time = now;
+    cache.last_update = now;
+    cache.cached = SysInfo { cpu_pct, rss_kb, layout };
+}
+
+fn format_sysinfo(info: &SysInfo, mode: u8) -> String {
+    match mode {
+        1 => {
+            let mem = if info.rss_kb < 1024 {
+                format!("{}KB", info.rss_kb)
+            } else {
+                format!("{:.1}MB", info.rss_kb as f64 / 1024.0)
+            };
+            format!("CPU: {:.1}% | RAM: {}", info.cpu_pct, mem)
+        }
+        _ => String::new(),
+    }
 }

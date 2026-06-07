@@ -454,6 +454,15 @@ pub struct FileState {
     pub sel_start: Pos,
     pub search_q: String,
     pub search_mode: bool,
+    pub block_comment: bool,
+    pub block_string: bool,
+    pub row_off: usize,
+    pub col_off: usize,
+    pub cached_search_q: String,
+    pub cached_total_matches: usize,
+    pub cached_current_match: usize,
+    pub pasting: bool,
+    pub max_undo: usize,
 }
 
 pub struct BrowserState {
@@ -479,4 +488,68 @@ pub fn nav_cursor(mods: KeyModifiers, last_action: &mut Action, file: &mut FileS
     } else {
         file.selecting = false;
     }
+}
+
+pub fn prescan_block_state(lines: &[String], up_to: usize, start_comment: bool, start_string: bool) -> (bool, bool) {
+    let mut bc = start_comment;
+    let mut bs = start_string;
+    let end = up_to.min(lines.len());
+    for li in 0..end {
+        let s = &lines[li];
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if bc {
+                if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                    bc = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if bs {
+                if i + 2 < chars.len() && chars[i] == '"' && chars[i + 1] == '"' && chars[i + 2] == '"' {
+                    bs = false;
+                    i += 3;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
+                break;
+            }
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                bc = true;
+                i += 2;
+                continue;
+            }
+            if i + 2 < chars.len() && chars[i] == '"' && chars[i + 1] == '"' && chars[i + 2] == '"' {
+                bs = true;
+                i += 3;
+                continue;
+            }
+            if chars[i] == '"' {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() { i += 1; }
+                    i += 1;
+                }
+                if i < chars.len() { i += 1; }
+                continue;
+            }
+            if chars[i] == '\'' {
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    if chars[i] == '\\' && i + 1 < chars.len() { i += 1; }
+                    i += 1;
+                }
+                if i < chars.len() { i += 1; }
+                continue;
+            }
+            i += 1;
+        }
+    }
+    (bc, bs)
 }

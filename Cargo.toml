@@ -4,4 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+
+[profile.release]
+opt-level = "z"
+strip = true 
+lto = true
+codegen-units = 1
