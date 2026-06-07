@@ -1,7 +1,7 @@
 # edit — terminal text editor in Rust
 
 A modal terminal text editor built on raw ANSI escape sequences, written in Rust. Supports syntax highlighting, tabs, file browser, themes, and Vim‑like command mode.
-https://github.com/ChurdakNeco/My-editor-/blob/main/editor.png
+![Интерфейс](editor.png)
 ## Features
 
 - Syntax highlighting: keywords, strings, numbers, comments (`//`, `/* */`), block strings (`"""`), attributes (`#[...]`)
