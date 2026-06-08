@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::fs::File;
 use crate::config::{Theme, theme_color, semantic_color};
 use crossterm::event::KeyModifiers;
 
@@ -442,6 +444,38 @@ pub fn render_browser_line(name: &str, is_dir: bool, active: bool, width: usize)
     out
 }
 
+pub fn collect_candidates(lines: &[String], prefix: &str) -> Vec<String> {
+    if prefix.len() < 2 {
+        return vec![];
+    }
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphanumeric() || chars[i] == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                if word != prefix && word.len() >= prefix.len()
+                    && word[..prefix.len()].eq_ignore_ascii_case(prefix)
+                    && seen.insert(word.clone())
+                {
+                    candidates.push(word);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    candidates.sort();
+    candidates.truncate(20);
+    candidates
+}
+
 pub struct FileState {
     pub path: Option<String>,
     pub lines: Vec<String>,
@@ -463,6 +497,75 @@ pub struct FileState {
     pub cached_current_match: usize,
     pub pasting: bool,
     pub max_undo: usize,
+    pub completion_candidates: Vec<String>,
+    pub completion_idx: usize,
+    pub completion_active: bool,
+    pub completion_prefix: String,
+}
+
+impl FileState {
+    pub fn new(path: Option<String>, lines: Vec<String>, snapshot: String) -> Self {
+        FileState {
+            path, lines, snapshot,
+            cursor: Pos { x: 0, y: 0 },
+            dirty: false,
+            undo: Vec::new(), redo: Vec::new(),
+            selecting: false, sel_start: Pos { x: 0, y: 0 },
+            search_q: String::new(), search_mode: false,
+            block_comment: false, block_string: false,
+            row_off: 0, col_off: 0,
+            cached_search_q: String::new(), cached_total_matches: 0, cached_current_match: 0,
+            pasting: false, max_undo: 500,
+            completion_candidates: Vec::new(), completion_idx: 0, completion_active: false, completion_prefix: String::new(),
+        }
+    }
+
+    pub fn save_undo(&mut self, last_action: &mut Action, expected: Action) {
+        let same = *last_action == expected && *last_action != Action::None;
+        if !same {
+            if self.undo.len() >= self.max_undo { self.undo.remove(0); }
+            self.undo.push(self.lines.clone());
+        }
+        *last_action = expected;
+        self.redo.clear();
+    }
+
+    pub fn clamp_cursor(&mut self) {
+        if self.cursor.y >= self.lines.len() {
+            self.cursor.y = self.lines.len().saturating_sub(1);
+        }
+        let cc = self.lines[self.cursor.y].chars().count();
+        if self.cursor.x > cc { self.cursor.x = cc; }
+    }
+
+    pub fn save_to_disk(&mut self) {
+        if let Some(ref path) = self.path {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(mut f) = File::create(path) {
+                let _ = write!(f, "{}", self.lines.join("\n"));
+                self.dirty = false;
+                self.snapshot = self.lines.join("\n");
+            }
+        }
+    }
+
+    pub fn update_completion(&mut self) {
+        let prefix: String = self.lines[self.cursor.y].chars().take(self.cursor.x)
+            .collect::<String>().chars().rev()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<Vec<_>>().into_iter().rev().collect();
+        if prefix.len() >= 2 {
+            self.completion_prefix = prefix;
+            self.completion_candidates = collect_candidates(&self.lines, &self.completion_prefix);
+            self.completion_idx = 0;
+            self.completion_active = !self.completion_candidates.is_empty();
+        } else {
+            self.completion_active = false;
+            self.completion_candidates.clear();
+        }
+    }
 }
 
 pub struct BrowserState {

@@ -77,7 +77,7 @@ pub fn default_bindings() -> Vec<(&'static str, KeyCombo)> {
         ("clear_buffer", KeyCombo { code: KeyCode::Char('k'), mods: KeyModifiers::CONTROL }),
         ("browser", KeyCombo { code: KeyCode::Char('n'), mods: KeyModifiers::CONTROL }),
         ("close_tab", KeyCombo { code: KeyCode::Char('w'), mods: KeyModifiers::CONTROL }),
-        ("browser_back", KeyCombo { code: KeyCode::Char('z'), mods: KeyModifiers::CONTROL }),
+        ("browser_back", KeyCombo { code: KeyCode::Left, mods: KeyModifiers::ALT }),
         ("home_file", KeyCombo { code: KeyCode::Home, mods: KeyModifiers::CONTROL }),
         ("end_file", KeyCombo { code: KeyCode::End, mods: KeyModifiers::CONTROL }),
         ("reorder", KeyCombo { code: KeyCode::Up, mods: KeyModifiers::CONTROL }),
@@ -85,6 +85,7 @@ pub fn default_bindings() -> Vec<(&'static str, KeyCombo)> {
         ("tab_next", KeyCombo { code: KeyCode::Right, mods: KeyModifiers::CONTROL }),
         ("save_quit", KeyCombo { code: KeyCode::Char('w'), mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT }),
         ("sysinfo", KeyCombo { code: KeyCode::Char('l'), mods: KeyModifiers::CONTROL }),
+        ("completion", KeyCombo { code: KeyCode::Char('m'), mods: KeyModifiers::CONTROL }),
     ]
 }
 
