@@ -119,7 +119,7 @@ pub fn config_dir() -> PathBuf {
             let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
             PathBuf::from(home).join(".config")
         });
-    base.join("edit")
+    base.join("wispy")
 }
 
 pub fn config_path() -> PathBuf { config_dir().join("config") }

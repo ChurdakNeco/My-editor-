@@ -1,4 +1,4 @@
-# edit — terminal text editor in Rust
+# wispy — terminal text editor in Rust
 
 A modal terminal text editor built on raw ANSI escape sequences, written in Rust. Supports syntax highlighting, tabs, file browser, themes, auto-completion, and Vim‑like command mode.
 ![Интерфейс](editor.png)
@@ -26,20 +26,21 @@ A modal terminal text editor built on raw ANSI escape sequences, written in Rust
 Requires Rust 1.70+:
 
 ```bash
-# Build
-git clone <repo> && cd editor
-cargo build --release
+# Install via cargo (recommended)
+cargo install wispy
 
-# Install to PATH
-cp target/release/edit ~/.cargo/bin/
+# Or build from source
+git clone <repo> && cd wispy
+cargo build --release
+cp target/release/wispy ~/.cargo/bin/
 ```
 
 ## Usage
 
 ```bash
-edit <file>           # Open file
-edit                  # Start with empty buffer
-edit dir/             # Start with file browser in dir
+wispy <file>           # Open file
+wispy                  # Start with empty buffer
+wispy dir/             # Start with file browser in dir
 ```
 
 ## Keybindings
@@ -116,7 +117,7 @@ edit dir/             # Start with file browser in dir
 
 ## Configuration
 
-Settings are stored in `~/.config/edit/config` (key = value format):
+Settings are stored in `~/.config/wispy/config` (key = value format):
 
 ```
 show_numbers = true

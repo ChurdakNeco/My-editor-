@@ -1,13 +1,16 @@
 [package]
-name = "edit"
+name = "wispy"
 version = "0.1.0"
 edition = "2021"
+description = "A modal terminal text editor with syntax highlighting, tabs, file browser, themes, and auto-completion"
+license = "MIT"
 
 [dependencies]
-crossterm = { version = "0.28", features = ["bracketed-paste"] }
+crossterm = "0.28"
 
 [profile.release]
 opt-level = "z"
 strip = true 
 lto = true
 codegen-units = 1
+panic = "abort"
